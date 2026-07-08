@@ -1,102 +1,128 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
+// Scene
+import PetriDish from '../scene/PetriDish.js';
+import Lighting from '../scene/Lighting.js';
+
+// Simulation
+import HeightField from '../simulation/HeightField.js';
+import Diffusion from '../simulation/Diffusion.js';
+import AudioAnalyser from '../simulation/AudioAnalyser.js';
+import AttractorSystem from '../simulation/AttractorSystem.js';
+import SpringField from '../simulation/SpringField.js';
+
+// Rendering
+import SpikeRenderer from '../rendering/SpikeRenderer.js';
+
+/**
+ * Engine — pure orchestrator.
+ *
+ * tick() order:
+ *   audio → attractors → field → diffusion → springs → render
+ *
+ * No simulation logic lives here.
+ * No rendering logic lives here.
+ */
 export default class Engine {
-  constructor(container) {
-    this.container = container;
-    
-    // Core components
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x000000); // Deep black environment
-    
-    // Camera - 45 FOV for a flatter, more cinematic perspective
-    this.camera = new THREE.PerspectiveCamera(
-      45, 
-      window.innerWidth / window.innerHeight, 
-      0.1, 
-      100
-    );
-    this.camera.position.set(0, 2, 6);
+    constructor(container) {
+        this.container = container;
 
-    // Renderer - Premium settings for visual fidelity
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    
-    // Cinematic tone mapping
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.2;
-    
-    // Soft shadows
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFShadowMap;
-    this.container.appendChild(this.renderer.domElement);
+        // ── WebGL Renderer ──────────────────────────────────────────────────
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        this.renderer.toneMappingExposure = 1.2;
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFShadowMap;
+        container.appendChild(this.renderer.domElement);
 
-    // Soft HDR Environment Lighting via RoomEnvironment
-    const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
-    pmremGenerator.compileEquirectangularShader();
-    this.scene.environment = pmremGenerator.fromScene(new RoomEnvironment()).texture;
+        // ── Scene ──────────────────────────────────────────────────────────
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x000000);
 
-    // Camera Controls
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.05;
-    this.controls.enablePan = false;
-    this.controls.minDistance = 2;
-    this.controls.maxDistance = 20;
+        // Soft HDR environment map
+        const pmrem = new THREE.PMREMGenerator(this.renderer);
+        pmrem.compileEquirectangularShader();
+        this.scene.environment = pmrem.fromScene(new RoomEnvironment()).texture;
 
-    // Scene Lighting setup
-    this.setupLighting();
+        // ── Camera ─────────────────────────────────────────────────────────
+        this.camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        this.camera.position.set(0, 3, 6);
 
-    // Event listeners
-    window.addEventListener('resize', this.onResize.bind(this));
+        // ── Controls ───────────────────────────────────────────────────────
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.05;
+        this.controls.enablePan = false;
+        this.controls.minDistance = 2;
+        this.controls.maxDistance = 20;
 
-    // Animation Loop
-    this.renderer.setAnimationLoop(this.tick.bind(this));
-  }
+        // ── Scene objects ──────────────────────────────────────────────────
+        this.scene.add(new PetriDish());
+        this.scene.add(new Lighting());
 
-  setupLighting() {
-    // Required for RectAreaLight to look correct
-    RectAreaLightUniformsLib.init();
+        // ── Simulation layer ───────────────────────────────────────────────
+        this.field     = new HeightField(80, 80, 1.85);
+        this.diffusion = new Diffusion({ passes: 2, decay: 0.88 });
+        this.audio     = new AudioAnalyser(1024);
+        this.attractors = new AttractorSystem({ demoMode: true }); // demo until mic connected
 
-    // 1. Soft Area Light (Key Light)
-    // Provides beautiful rectangular reflections on glossy surfaces
-    const areaLight = new THREE.RectAreaLight(0xffffff, 4.0, 5, 5);
-    areaLight.position.set(0, 5, 2);
-    areaLight.lookAt(0, 0, 0);
-    this.scene.add(areaLight);
+        // ── Rendering layer ────────────────────────────────────────────────
+        this.spikeRenderer = new SpikeRenderer({ count: 2000, dishRadius: 1.85, baseY: 0.08 });
+        this.scene.add(this.spikeRenderer);
 
-    // 2. Rim Light (Backlight)
-    // Helps separate subjects from the black background with a sharp, bright edge
-    // SpotLight(color, intensity, distance, angle, penumbra, decay)
-    const rimLight = new THREE.SpotLight(0xffffff, 80, 0, Math.PI / 4, 0.5, 2.0);
-    rimLight.position.set(-4, 3, -4);
-    rimLight.lookAt(0, 0, 0);
-    
-    // Enable soft shadows for the rim light
-    rimLight.castShadow = true;
-    rimLight.shadow.mapSize.width = 2048;
-    rimLight.shadow.mapSize.height = 2048;
-    rimLight.shadow.bias = -0.0001;
-    rimLight.shadow.radius = 4; // Blurs the shadow edges
-    
-    this.scene.add(rimLight);
-  }
+        // SpringField reads from the same positions used by SpikeRenderer
+        this.springs = new SpringField(this.spikeRenderer.positions, {
+            tension: 80,
+            damping: 10,
+            mass: 3.0,
+            restHeight: 1.0,
+        });
 
-  onResize() {
-    this.camera.aspect = window.innerWidth / window.innerHeight;
-    this.camera.updateProjectionMatrix();
+        // ── Timer (lightweight, avoids deprecated THREE.Clock) ────────────────
+        this._lastTime = performance.now();
+        this._getDelta = () => {
+            const now = performance.now();
+            const dt  = Math.min((now - this._lastTime) / 1000, 0.05);
+            this._lastTime = now;
+            return dt;
+        };
 
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  }
+        // ── Events ─────────────────────────────────────────────────────────
+        window.addEventListener('resize', this.onResize.bind(this));
 
-  tick() {
-    // Required for orbit controls damping
-    this.controls.update(); 
-    
-    this.renderer.render(this.scene, this.camera);
-  }
+        // ── Loop ───────────────────────────────────────────────────────────
+        this.renderer.setAnimationLoop(this.tick.bind(this));
+    }
+
+    tick() {
+        const dt     = this._getDelta();
+        const energy = this.audio.getBandEnergy();           // { bass, mid, treble } 0–1
+
+        // 1. Attractors stamp Gaussian bumps onto the field
+        this.attractors.update(this.field, energy, dt);
+
+        // 2. Diffusion spreads energy across neighboring cells
+        this.diffusion.apply(this.field);
+
+        // 3. Springs stabilize to sampled field values
+        this.springs.update(this.field, dt);
+
+        // 4. Renderer reads spring heights — no simulation logic
+        this.spikeRenderer.render(this.springs);
+
+        // 5. Three.js draw call
+        this.controls.update();
+        this.renderer.render(this.scene, this.camera);
+    }
+
+    onResize() {
+        this.camera.aspect = window.innerWidth / window.innerHeight;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    }
 }
